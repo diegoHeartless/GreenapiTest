@@ -1,13 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 const API_URL = import.meta.env.VITE_GREEN_API_URL || 'https://api.green-api.com'
-const savedInstance = import.meta.env.VITE_GREEN_API_INSTANCE_ID || ''
-const savedToken = import.meta.env.VITE_GREEN_API_TOKEN || ''
 
 function getConfig() {
   return {
-    instanceId: localStorage.getItem('green_instance_id') || savedInstance,
-    token: localStorage.getItem('green_token') || savedToken
+    instanceId: localStorage.getItem('green_instance_id') || '',
+    token: localStorage.getItem('green_token') || ''
   }
 }
 
@@ -22,73 +20,130 @@ function formatTime(date) {
   }).format(date)
 }
 
+function normalizePhone(phone) {
+  const value = (phone || '').replace(/[^\d]/g, '')
+  if (!value) return ''
+  return value
+}
+
+// Пример: если нужен формат вида 79001234567@c.us,
+// можно заменить здесь. Для MVP достаточно использовать телефон как chatId,
+// если у вашего GREEN-API так принято.
+function normalizePhoneToChatId(phone) {
+  const number = normalizePhone(phone)
+  if (!number) return ''
+  return number
+}
+
 export default function App() {
   const [config, setConfig] = useState(getConfig)
-  const [chatId, setChatId] = useState(localStorage.getItem('green_chat_id') || '')
-  const [draft, setDraft] = useState('')
-  const [messages, setMessages] = useState([])
   const [status, setStatus] = useState('Не подключено')
   const [error, setError] = useState('')
-  const [settingsOpen, setSettingsOpen] = useState(!getConfig().instanceId || !getConfig().token)
+  const [settingsOpen, setSettingsOpen] = useState(true)
+  const [phoneInput, setPhoneInput] = useState('')
+  const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
-  const polling = useRef(false)
+
+  const [activeChatId, setActiveChatId] = useState('')
+  const [chats, setChats] = useState({}) // { [chatId]: [{ id, text, incoming, time }] }
+
+  const pollingRef = useRef(false)
 
   const canConnect = Boolean(config.instanceId && config.token)
 
-  const visibleMessages = useMemo(
-    () => messages.filter(m => !m.chatId || !chatId || m.chatId === chatId),
-    [messages, chatId]
-  )
+  const chatList = useMemo(() => Object.keys(chats), [chats])
+  const activeMessages = activeChatId ? chats[activeChatId] || [] : []
 
-  const receive = useCallback(async () => {
-    if (!canConnect || polling.current) return
+  useEffect(() => {
+    if (!canConnect) {
+      setStatus('Не подключено')
+      return
+    }
+    setStatus('Подключено')
+    const timer = setInterval(receiveNotifications, 1500)
+    receiveNotifications()
+    return () => clearInterval(timer)
+  }, [canConnect, config])
 
-    polling.current = true
+  const createOrOpenChat = useCallback((phone) => {
+    const chatId = normalizePhoneToChatId(phone)
+    if (!chatId) {
+      setError('Введите корректный номер телефона')
+      return
+    }
+
+    setChats(prev => {
+      if (!prev[chatId]) {
+        prev[chatId] = []
+      }
+      return { ...prev }
+    })
+
+    setActiveChatId(chatId)
+    setPhoneInput('')
+    setError('')
+  }, [])
+
+  const receiveNotifications = useCallback(async () => {
+    if (!canConnect || pollingRef.current) return
+    pollingRef.current = true
 
     try {
       const response = await fetch(apiUrl('receiveNotification', config))
-
       if (!response.ok) {
         const text = await response.text()
-        throw new Error(`GREEN-API error: ${response.status}. ${text || 'empty response'}`)
+        throw new Error(`GREEN-API: ${response.status}. ${text || 'empty response'}`)
       }
 
-      const text = await response.text()
-
-      if (!text) {
-        return
-      }
+      const raw = await response.text()
+      if (!raw) return
 
       let notification
       try {
-        notification = JSON.parse(text)
-      } catch (e) {
-        throw new Error(`GREEN-API returned not JSON: ${text.slice(0, 200)}`)
+        notification = JSON.parse(raw)
+      } catch {
+        throw new Error('GREEN-API вернул не JSON')
       }
 
       if (!notification) return
 
       const body = notification.body || {}
       const data = body.messageData || {}
-      const messageText =
+      const text =
         data.textMessageData?.textMessage ||
         data.extendedTextMessageData?.text ||
         ''
 
-      const incomingChat = body.senderData?.chatId || body.chatId || ''
+      const incomingChatId =
+        body.senderData?.chatId || body.chatId || ''
 
-      if (messageText) {
-        setMessages(prev => [
-          ...prev,
+      if (!incomingChatId || !text) {
+        if (notification.receiptId) {
+          await fetch(apiUrl(`deleteNotification/${notification.receiptId}`, config), {
+            method: 'DELETE'
+          })
+        }
+        return
+      }
+
+      setChats(prev => {
+        const next = { ...prev }
+        if (!next[incomingChatId]) {
+          next[incomingChatId] = []
+        }
+
+        next[incomingChatId] = [
+          ...next[incomingChatId],
           {
             id: notification.receiptId || crypto.randomUUID(),
-            text: messageText,
+            text,
             incoming: true,
-            chatId: incomingChat,
             time: new Date()
           }
-        ])
-      }
+        ]
+
+        return next
+      })
 
       if (notification.receiptId) {
         await fetch(apiUrl(`deleteNotification/${notification.receiptId}`, config), {
@@ -98,44 +153,39 @@ export default function App() {
     } catch (e) {
       setError(e.message)
     } finally {
-      polling.current = false
+      pollingRef.current = false
     }
   }, [canConnect, config])
 
-  useEffect(() => {
-    if (!canConnect) return undefined
-
-    setStatus('Подключено')
-    const timer = setInterval(receive, 1500)
-    receive()
-
-    return () => clearInterval(timer)
-  }, [canConnect, receive])
-
-  function saveSettings(event) {
-    event.preventDefault()
-
+  const submitLogin = (e) => {
+    e.preventDefault()
     const instanceId = config.instanceId.trim()
     const token = config.token.trim()
+
+    if (!instanceId || !token) {
+      setError('Введите idInstance и apiTokenInstance')
+      return
+    }
 
     localStorage.setItem('green_instance_id', instanceId)
     localStorage.setItem('green_token', token)
 
-    setConfig({ instanceId, token })
     setSettingsOpen(false)
     setError('')
   }
 
-  function selectChat(value) {
-    setChatId(value)
-    localStorage.setItem('green_chat_id', value)
-  }
-
-  async function sendMessage(event) {
-    event.preventDefault()
+  const sendMessage = async (e) => {
+    e.preventDefault()
+    if (!canConnect) {
+      setError('Сначала подключитесь к GREEN-API')
+      return
+    }
 
     const text = draft.trim()
-    if (!text || !chatId.trim() || !canConnect) return
+    if (!text || !activeChatId) {
+      setError('Введите сообщение и откройте чат')
+      return
+    }
 
     setSending(true)
     setError('')
@@ -145,39 +195,30 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          chatId: chatId.trim(),
+          chatId: activeChatId,
           message: text
         })
       })
 
       if (!response.ok) {
         const errorText = await response.text()
-        throw new Error(`Не удалось отправить сообщение (${response.status}). ${errorText || 'empty response'}`)
+        throw new Error(`Ошибка отправки: ${response.status}. ${errorText || 'empty response'}`)
       }
 
-      const resultText = await response.text()
-
-      if (resultText) {
-        try {
-          const result = JSON.parse(resultText)
-          if (result?.idMessage || result?.messageId) {
-            // OK
+      setChats(prev => {
+        const next = { ...prev }
+        if (!next[activeChatId]) next[activeChatId] = []
+        next[activeChatId] = [
+          ...next[activeChatId],
+          {
+            id: crypto.randomUUID(),
+            text,
+            incoming: false,
+            time: new Date()
           }
-        } catch {
-          // ignore
-        }
-      }
-
-      setMessages(prev => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          text,
-          incoming: false,
-          chatId: chatId.trim(),
-          time: new Date()
-        }
-      ])
+        ]
+        return next
+      })
 
       setDraft('')
     } catch (e) {
@@ -194,7 +235,11 @@ export default function App() {
           <span className="brand-mark">M</span>
           <span>MAX</span>
         </div>
-        <button className="settings-button" onClick={() => setSettingsOpen(true)} aria-label="Настройки">
+        <button
+          type="button"
+          className="settings-button"
+          onClick={() => setSettingsOpen(true)}
+        >
           ⚙
         </button>
       </header>
@@ -204,63 +249,83 @@ export default function App() {
           <div className="profile">
             <div className="avatar">M</div>
             <div>
-              <strong>Мои сообщения</strong>
+              <strong>Мои чаты</strong>
               <small className={canConnect ? 'online' : ''}>{status}</small>
             </div>
           </div>
 
-          <label className="search">
-            <span>⌕</span>
+          <div className="new-chat-box">
             <input
-              value={chatId}
-              onChange={e => selectChat(e.target.value)}
-              placeholder="Введите chatId"
+              value={phoneInput}
+              onChange={e => setPhoneInput(e.target.value)}
+              placeholder="Номер получателя"
             />
-          </label>
+            <button
+              type="button"
+              onClick={() => createOrOpenChat(phoneInput)}
+            >
+              Новый чат
+            </button>
+          </div>
 
           <div className="chat-list">
-            {chatId ? (
-              <button className="chat-preview active" type="button">
-                <div className="avatar small">{chatId[0]?.toUpperCase() || 'C'}</div>
-                <div>
+            {chatList.length === 0 && (
+              <p className="empty-list">Нажмите «Новый чат» и введите номер получателя</p>
+            )}
+
+            {chatList.map(chatId => (
+              <button
+                key={chatId}
+                type="button"
+                className={`chat-item ${chatId === activeChatId ? 'active' : ''}`}
+                onClick={() => setActiveChatId(chatId)}
+              >
+                <div className="avatar small">{chatId.slice(0, 1).toUpperCase()}</div>
+                <div className="chat-item-text">
                   <strong>{chatId}</strong>
-                  <small>{visibleMessages.at(-1)?.text || 'Начните диалог'}</small>
+                  <small>
+                    {chats[chatId]?.at(-1)?.text || 'Начните диалог'}
+                  </small>
                 </div>
               </button>
-            ) : (
-              <p className="empty-list">Укажите chatId, чтобы начать диалог</p>
-            )}
+            ))}
           </div>
         </aside>
 
         <section className="conversation">
-          {chatId ? (
+          {!activeChatId ? (
+            <div className="empty-state">
+              <div className="welcome-icon">M</div>
+              <h2>Ваши сообщения</h2>
+              <p>Создайте чат и начните переписку</p>
+            </div>
+          ) : (
             <>
               <div className="conversation-head">
-                <div className="avatar small">{chatId[0]?.toUpperCase() || 'C'}</div>
+                <div className="avatar small">{activeChatId.slice(0, 1).toUpperCase()}</div>
                 <div>
-                  <strong>{chatId}</strong>
-                  <small>Текстовые сообщения</small>
+                  <strong>{activeChatId}</strong>
+                  <small>MAX • текстовые сообщения</small>
                 </div>
               </div>
 
               <div className="message-area">
-                {visibleMessages.length === 0 && (
+                {activeMessages.length === 0 && (
                   <div className="welcome">
                     <div className="welcome-icon">M</div>
                     <h2>Начните общение</h2>
-                    <p>Отправляйте текстовые сообщения через GREEN-API</p>
+                    <p>Отправьте первое сообщение</p>
                   </div>
                 )}
 
-                {visibleMessages.map(message => (
+                {activeMessages.map(msg => (
                   <div
-                    key={message.id}
-                    className={`message-row ${message.incoming ? 'incoming' : 'outgoing'}`}
+                    key={msg.id}
+                    className={`message-row ${msg.incoming ? 'incoming' : 'outgoing'}`}
                   >
                     <div className="message">
-                      <span>{message.text}</span>
-                      <small>{formatTime(message.time)} {!message.incoming && '✓'}</small>
+                      <span>{msg.text}</span>
+                      <small>{formatTime(msg.time)} {!msg.incoming && '✓'}</small>
                     </div>
                   </div>
                 ))}
@@ -273,17 +338,14 @@ export default function App() {
                   placeholder="Написать сообщение..."
                   disabled={!canConnect || sending}
                 />
-                <button type="submit" disabled={!canConnect || !draft.trim() || sending} aria-label="Отправить">
+                <button
+                  type="submit"
+                  disabled={!canConnect || !draft.trim() || sending}
+                >
                   ➤
                 </button>
               </form>
             </>
-          ) : (
-            <div className="welcome">
-              <div className="welcome-icon">M</div>
-              <h2>Ваши сообщения</h2>
-              <p>Введите chatId слева, чтобы открыть диалог</p>
-            </div>
           )}
         </section>
       </main>
@@ -297,13 +359,23 @@ export default function App() {
 
       {settingsOpen && (
         <div className="modal-backdrop">
-          <form className="modal" onSubmit={saveSettings}>
-            <button type="button" className="close" onClick={() => setSettingsOpen(false)}>×</button>
-            <h2>Подключение GREEN-API</h2>
-            <p>Данные используются только в этом браузере.</p>
+          <form className="modal" onSubmit={submitLogin}>
+            <button
+              type="button"
+              className="close"
+              onClick={() => {
+                if (!canConnect) return
+                setSettingsOpen(false)
+              }}
+            >
+              ×
+            </button>
+
+            <h2>GREEN-API</h2>
+            <p>Введите учетные данные для MAX</p>
 
             <label>
-              IdInstance
+              idInstance
               <input
                 value={config.instanceId}
                 onChange={e => setConfig({ ...config, instanceId: e.target.value })}
@@ -312,7 +384,7 @@ export default function App() {
             </label>
 
             <label>
-              ApiTokenInstance
+              apiTokenInstance
               <input
                 type="password"
                 value={config.token}
@@ -321,9 +393,13 @@ export default function App() {
               />
             </label>
 
-            <button className="primary" type="submit">Подключиться</button>
+            <button type="submit" className="primary">
+              Подключиться
+            </button>
+
             <small className="hint">
-              Получить данные можно в личном кабинете GREEN-API для MAX.
+              Для учебного MVP данные сохраняются в localStorage.
+              Для production лучше использовать backend proxy.
             </small>
           </form>
         </div>
