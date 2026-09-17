@@ -47,22 +47,42 @@ export default function App() {
 
     try {
       const response = await fetch(apiUrl('receiveNotification', config))
-      if (!response.ok) throw new Error(`Ошибка получения (${response.status})`)
 
-      const notification = await response.json()
+      if (!response.ok) {
+        const text = await response.text()
+        throw new Error(`GREEN-API error: ${response.status}. ${text || 'empty response'}`)
+      }
+
+      const text = await response.text()
+
+      if (!text) {
+        return
+      }
+
+      let notification
+      try {
+        notification = JSON.parse(text)
+      } catch (e) {
+        throw new Error(`GREEN-API returned not JSON: ${text.slice(0, 200)}`)
+      }
+
       if (!notification) return
 
       const body = notification.body || {}
       const data = body.messageData || {}
-      const text = data.textMessageData?.textMessage || data.extendedTextMessageData?.text || ''
+      const messageText =
+        data.textMessageData?.textMessage ||
+        data.extendedTextMessageData?.text ||
+        ''
+
       const incomingChat = body.senderData?.chatId || body.chatId || ''
 
-      if (text) {
+      if (messageText) {
         setMessages(prev => [
           ...prev,
           {
             id: notification.receiptId || crypto.randomUUID(),
-            text,
+            text: messageText,
             incoming: true,
             chatId: incomingChat,
             time: new Date()
@@ -131,16 +151,33 @@ export default function App() {
       })
 
       if (!response.ok) {
-        throw new Error(`Не удалось отправить сообщение (${response.status})`)
+        const errorText = await response.text()
+        throw new Error(`Не удалось отправить сообщение (${response.status}). ${errorText || 'empty response'}`)
       }
 
-      setMessages(prev => [...prev, {
-        id: crypto.randomUUID(),
-        text,
-        incoming: false,
-        chatId: chatId.trim(),
-        time: new Date()
-      }])
+      const resultText = await response.text()
+
+      if (resultText) {
+        try {
+          const result = JSON.parse(resultText)
+          if (result?.idMessage || result?.messageId) {
+            // OK
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      setMessages(prev => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          text,
+          incoming: false,
+          chatId: chatId.trim(),
+          time: new Date()
+        }
+      ])
 
       setDraft('')
     } catch (e) {
@@ -242,7 +279,7 @@ export default function App() {
               </form>
             </>
           ) : (
-            <div className="welcome start">
+            <div className="welcome">
               <div className="welcome-icon">M</div>
               <h2>Ваши сообщения</h2>
               <p>Введите chatId слева, чтобы открыть диалог</p>
